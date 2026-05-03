@@ -21,8 +21,8 @@ from PIL import Image
 # ==========================================
 # 1. 全局配置与绝对路径
 # ==========================================
-POS_EXCEL_PATH = "/home/fuxiangyu/jlx/MVI/MVI_ceus0325/0325data/MVI1.xlsx"
-NEG_EXCEL_PATH = "/home/fuxiangyu/jlx/MVI/MVI_ceus0325/0325data/MVI0.xlsx"
+POS_EXCEL_PATH = "/home/fuxiangyu/jlx/MVI/MVI_ceus0325/0325data/MVI阳性临床资料-原始数值.xlsx"
+NEG_EXCEL_PATH = "/home/fuxiangyu/jlx/MVI/MVI_ceus0325/0325data/MVI阴性临床资料-原始数值.xlsx"
 IMAGE_ROOT_DIR = "/home/fuxiangyu/jlx/MVI/MVI_ceus0325/0325processed"
 
 FOLDER_MAPPING = {'0_MVI_Negative': 0, '1_MVI_Positive': 1}
@@ -63,13 +63,29 @@ def clean_clinical_data(pos_path, neg_path):
     df_neg.columns = standard_columns
     
     df_clinical = pd.concat([df_pos, df_neg], ignore_index=True)
-    df_clinical.fillna(0, inplace=True)
+
+    # 【Step 2】性别编码
     df_clinical['性别'] = df_clinical['性别'].map({'男': 1, '女': 0})
-    df_clinical['年龄'] = (df_clinical['年龄'] - df_clinical['年龄'].mean()) / df_clinical['年龄'].std()
-    
-    # 【核心修改】：抛弃噪音，只留 5 把尖刀
-    # feature_cols = ['甲胎蛋白', '异常凝血酶原', 'HBV', '年龄', '性别']
+
+    # 【Step 2】区分二分类特征和连续型特征
     feature_cols = [col for col in standard_columns if col != '超声号']
+    binary_cols = ['性别', 'HBV', 'HCV']
+    continuous_cols = [col for col in feature_cols if col not in binary_cols]
+
+    # 【Step 2】缺失值处理：二分类填0，连续型填中位数
+    for col in binary_cols:
+        df_clinical[col].fillna(0, inplace=True)
+    for col in continuous_cols:
+        df_clinical[col].fillna(df_clinical[col].median(), inplace=True)
+
+    # 【Step 2】所有连续型特征做 Z-score 标准化（包括年龄）
+    for col in continuous_cols:
+        mean_val = df_clinical[col].mean()
+        std_val = df_clinical[col].std()
+        if std_val > 0:
+            df_clinical[col] = (df_clinical[col] - mean_val) / std_val
+        else:
+            df_clinical[col] = 0.0  # 标准差为0说明该特征无变化，置零
 
     
     clinical_dict = {}
@@ -183,16 +199,29 @@ class MultiModalResNet18(nn.Module):
 def train_multimodal_resnet():
     clinical_dict, num_features = clean_clinical_data(POS_EXCEL_PATH, NEG_EXCEL_PATH)
     base_dataset = MultimodalDataset(root_dir=IMAGE_ROOT_DIR, clinical_dict=clinical_dict, transform=None)
-    
+
+    # 【Step 1】按患者切分而非按图像切分，避免数据泄露
+    all_patient_ids = [os.path.basename(p).split('_')[0] for p in base_dataset.image_paths]
+    unique_patients = sorted(set(all_patient_ids))
+    print(f"\n========== 开始 MultiModal-ResNet18 训练 ==========")
+    print(f"视觉分支: ResNet18 (512D) | 临床分支: {num_features}维核心特征 (32D)")
+    print(f"共 {len(unique_patients)} 个独立患者, {len(base_dataset)} 张图像")
+
     kf = KFold(n_splits=N_SPLITS, shuffle=True, random_state=42)
     auc_list, acc_list, sen_list, spe_list = [], [], [], []
 
-    print(f"\n========== 开始 MultiModal-ResNet18 训练 ==========")
-    print(f"视觉分支: ResNet18 (512D) | 临床分支: {num_features}维核心特征 (32D)")
-    print(f"总有效样本数: {len(base_dataset)}")
-    
-    for fold, (train_idx, test_idx) in enumerate(kf.split(base_dataset)):
+    for fold, (train_p_idx, test_p_idx) in enumerate(kf.split(unique_patients)):
+        train_pids = set([unique_patients[i] for i in train_p_idx])
+        test_pids = set([unique_patients[i] for i in test_p_idx])
+
+        # 根据患者ID映射回图像索引
+        train_idx = [i for i, pid in enumerate(all_patient_ids) if pid in train_pids]
+        test_idx = [i for i, pid in enumerate(all_patient_ids) if pid in test_pids]
+
+        # 验证无泄露
+        assert len(train_pids & test_pids) == 0, "数据泄露！训练集和测试集存在相同患者"
         print(f"\n--- Fold {fold+1}/{N_SPLITS} ---")
+        print(f"  训练: {len(train_pids)}患者/{len(train_idx)}图像, 测试: {len(test_pids)}患者/{len(test_idx)}图像")
         
         train_dataset = KFoldDatasetWrapper(Subset(base_dataset, train_idx), transform=train_transform)
         test_dataset = KFoldDatasetWrapper(Subset(base_dataset, test_idx), transform=test_transform)

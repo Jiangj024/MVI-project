@@ -98,14 +98,29 @@ def evaluate(model, loader):
 # =========================
 # 4. 5-Fold 交叉验证与模型训练
 # =========================
+# 【Step 1】按患者切分而非按图像切分，避免数据泄露
+all_patient_ids = [os.path.basename(path).split('_')[0] for path, _ in base_dataset.samples]
+unique_patients = sorted(set(all_patient_ids))
+print(f"共 {len(unique_patients)} 个独立患者, {len(base_dataset)} 张图像")
+
 kf = KFold(n_splits=N_SPLITS, shuffle=True, random_state=42)
 
 auc_list, acc_list, sen_list, spe_list = [], [], [], []
 start_time = time.time()
 os.makedirs("MVI_vit_pth_tuned", exist_ok=True)
 
-for fold, (train_idx, test_idx) in enumerate(kf.split(base_dataset)):
+for fold, (train_p_idx, test_p_idx) in enumerate(kf.split(unique_patients)):
+    train_pids = set([unique_patients[i] for i in train_p_idx])
+    test_pids = set([unique_patients[i] for i in test_p_idx])
+
+    # 根据患者ID映射回图像索引
+    train_idx = [i for i, pid in enumerate(all_patient_ids) if pid in train_pids]
+    test_idx = [i for i, pid in enumerate(all_patient_ids) if pid in test_pids]
+
+    # 验证无泄露
+    assert len(train_pids & test_pids) == 0, "数据泄露！训练集和测试集存在相同患者"
     print(f"\n========== Fold {fold+1}/{N_SPLITS} ==========")
+    print(f"  训练: {len(train_pids)}患者/{len(train_idx)}图像, 测试: {len(test_pids)}患者/{len(test_idx)}图像")
     
     train_dataset = KFoldDatasetWrapper(Subset(base_dataset, train_idx), train_transform)
     test_dataset = KFoldDatasetWrapper(Subset(base_dataset, test_idx), test_transform)

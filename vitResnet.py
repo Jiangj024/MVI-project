@@ -19,8 +19,8 @@ from PIL import Image
 # ==========================================
 # 1. 全局配置与路径 (请务必核对这两个权重文件夹的名字！)
 # ==========================================
-POS_EXCEL_PATH = "/home/fuxiangyu/jlx/MVI/MVI_ceus0325/0325data/MVI1.xlsx"
-NEG_EXCEL_PATH = "/home/fuxiangyu/jlx/MVI/MVI_ceus0325/0325data/MVI0.xlsx"
+POS_EXCEL_PATH = "/home/fuxiangyu/jlx/MVI/MVI_ceus0325/0325data/MVI阳性临床资料-原始数值.xlsx"
+NEG_EXCEL_PATH = "/home/fuxiangyu/jlx/MVI/MVI_ceus0325/0325data/MVI阴性临床资料-原始数值.xlsx"
 IMAGE_ROOT_DIR = "/home/fuxiangyu/jlx/MVI/MVI_ceus0325/0325processed"
 
 # 权重路径：指向你之前分别跑出来的两个多模态模型的保存文件夹
@@ -122,15 +122,26 @@ class MultiModalResNet18(nn.Module):
 def run_ensemble():
     clinical_dict, num_features = clean_clinical_data(POS_EXCEL_PATH, NEG_EXCEL_PATH)
     base_dataset = MultimodalDataset(root_dir=IMAGE_ROOT_DIR, clinical_dict=clinical_dict)
-    
+
+    # 【Step 1】按患者切分而非按图像切分，避免数据泄露
+    all_patient_ids = [os.path.basename(p).split('_')[0] for p in base_dataset.image_paths]
+    unique_patients = sorted(set(all_patient_ids))
+
     # 极度重要：必须保持 random_state=42，保证每次切分的测试集和训练时一模一样！
     kf = KFold(n_splits=N_SPLITS, shuffle=True, random_state=42)
-    
+
     auc_list, acc_list, sen_list, spe_list = [], [], [], []
     print("\n========== 开始双模态专家集成 (ViT + ResNet18) ==========")
+    print(f"共 {len(unique_patients)} 个独立患者, {len(base_dataset)} 张图像")
 
-    for fold, (_, test_idx) in enumerate(kf.split(base_dataset)):
+    for fold, (_, test_p_idx) in enumerate(kf.split(unique_patients)):
+        test_pids = set([unique_patients[i] for i in test_p_idx])
+
+        # 根据患者ID映射回图像索引
+        test_idx = [i for i, pid in enumerate(all_patient_ids) if pid in test_pids]
+
         print(f"\n正在处理 Fold {fold+1}/{N_SPLITS}...")
+        print(f"  测试: {len(test_pids)}患者/{len(test_idx)}图像")
         test_loader = DataLoader(KFoldDatasetWrapper(Subset(base_dataset, test_idx)), batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
 
         # 检查权重文件

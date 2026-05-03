@@ -15,7 +15,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, Subset
 from torchvision import transforms, models
-from sklearn.model_selection import KFold
+from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score, accuracy_score, confusion_matrix
 from PIL import Image
 
@@ -174,130 +174,11 @@ class KFoldDatasetWrapper(Dataset):
     def __init__(self, subset, transform=None):
         self.subset = subset
         self.transform = transform
-
     def __getitem__(self, index):
-        items = self.subset[index]
-        if len(items) == 3:
-            # 旧版: (image, clinical, label)
-            x, c, y = items
-            if self.transform:
-                x = self.transform(x)
-            return x, c, y
-        elif len(items) == 4:
-            # 新版: (images, clinical, label, phase_mask)
-            imgs, c, y, mask = items
-            if self.transform:
-                if isinstance(imgs, torch.Tensor):
-                    # 已经是tensor，不需要transform
-                    pass
-                else:
-                    # imgs 是 list of PIL Images
-                    imgs = torch.stack([self.transform(img) for img in imgs], dim=0)
-            return imgs, c, y, mask
-
-    def __len__(self):
-        return len(self.subset)
-
-class MultiPhaseDataset(Dataset):
-    """
-    患者级别的多时相数据集
-    每条数据 = 一个患者的所有时相图像 + 临床特征 + 标签
-
-    输出:
-        images: [num_phases, 3, 224, 224]  (num_phases=4: grey/ap/pp/lp)
-        clinical: [num_features]
-        label: int (0 or 1)
-        phase_mask: [num_phases] (1=该时相存在, 0=缺失)
-
-    处理逻辑:
-        - 同一患者同一时相如果有多张图（不同造影剂），随机选一张
-        - 缺失时相用零张量填充，同时返回 phase_mask 标记哪些时相存在
-    """
-    PHASE_ORDER = ['grey', 'ap', 'pp', 'lp']
-
-    def __init__(self, root_dir, clinical_dict, transform=None):
-        self.transform = transform
-        self.samples = []
-
-        # 按患者ID分组收集图像路径
-        patient_data = {}  # {pid: {'label': int, 'phases': {phase: [path1, path2, ...]}}}
-
-        for folder_name, label in FOLDER_MAPPING.items():
-            folder_path = os.path.join(root_dir, folder_name)
-            if not os.path.isdir(folder_path):
-                continue
-            for img_name in os.listdir(folder_path):
-                if not img_name.lower().endswith(('.png', '.jpg', '.jpeg')):
-                    continue
-
-                parts = img_name.split('_')
-                patient_id = parts[0]
-                phase = parts[1].lower()  # grey / ap / pp / lp
-
-                if patient_id not in clinical_dict:
-                    continue
-                if phase not in self.PHASE_ORDER:
-                    print(f"警告: 未知时相 '{phase}' in {img_name}, 跳过")
-                    continue
-
-                if patient_id not in patient_data:
-                    patient_data[patient_id] = {
-                        'label': label,
-                        'phases': {p: [] for p in self.PHASE_ORDER}
-                    }
-                patient_data[patient_id]['phases'][phase].append(
-                    os.path.join(folder_path, img_name)
-                )
-
-        # 构建样本列表
-        for pid, data in patient_data.items():
-            self.samples.append({
-                'patient_id': pid,
-                'label': data['label'],
-                'phase_paths': data['phases'],  # {phase: [path_list]}
-                'clinical': torch.tensor(clinical_dict[pid], dtype=torch.float32)
-            })
-
-        # 统计
-        phase_counts = {p: 0 for p in self.PHASE_ORDER}
-        for s in self.samples:
-            for p in self.PHASE_ORDER:
-                if len(s['phase_paths'][p]) > 0:
-                    phase_counts[p] += 1
-        print(f"MultiPhaseDataset: {len(self.samples)} 患者")
-        for p in self.PHASE_ORDER:
-            print(f"  {p}: {phase_counts[p]}/{len(self.samples)} 患者有该时相")
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        sample = self.samples[idx]
-        images = []
-        phase_mask = []  # 1=该时相存在, 0=缺失
-
-        for phase in self.PHASE_ORDER:
-            paths = sample['phase_paths'][phase]
-            if len(paths) > 0:
-                # 如果同一时相有多张图（不同造影剂），训练时随机选一张，测试时选第一张
-                chosen_path = random.choice(paths) if self.transform else paths[0]
-                img = Image.open(chosen_path).convert('RGB')
-                phase_mask.append(1)
-            else:
-                # 缺失时相: 创建占位图像（后续会被 mask 掉）
-                img = Image.new('RGB', (224, 224), (0, 0, 0))
-                phase_mask.append(0)
-
-            if self.transform:
-                img = self.transform(img)
-            images.append(img)
-
-        if isinstance(images[0], torch.Tensor):
-            images = torch.stack(images, dim=0)  # [4, 3, 224, 224]
-
-        phase_mask = torch.tensor(phase_mask, dtype=torch.float32)  # [4]
-
-        return images, sample['clinical'], sample['label'], phase_mask
+        x, c, y = self.subset[index]
+        if self.transform: x = self.transform(x)
+        return x, c, y
+    def __len__(self): return len(self.subset)
 
 # ==========================================
 # 3. 多模态融合网络模型 (核心！)
@@ -387,15 +268,25 @@ def train_multimodal():
 
     # 2. 获取唯一患者列表
     unique_patients = list(patient_to_indices.keys())
+
+    # 提取每个患者的标签（用于分层切分）
+    patient_label_map = {}
+    for pid, indices in patient_to_indices.items():
+        patient_label_map[pid] = base_dataset.labels[indices[0]]
+    patient_labels = [patient_label_map[pid] for pid in unique_patients]
+
+    pos_count = sum(patient_labels)
+    neg_count = len(patient_labels) - pos_count
     print(f"\n========== 开始多模态融合模型训练 (ViT + {num_features}维临床数据) ==========")
     print(f"总有效样本数: {len(base_dataset)} (来自 {len(unique_patients)} 个患者)")
     print(f"平均每个患者图像数: {len(base_dataset) / len(unique_patients):.2f}")
+    print(f"患者标签分布: MVI+ {pos_count}, MVI- {neg_count}, 阳性率 {pos_count/len(patient_labels):.1%}")
 
-    kf = KFold(n_splits=N_SPLITS, shuffle=True, random_state=42)
+    skf = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=42)
     auc_list, acc_list, sen_list, spe_list = [], [], [], []
 
-    # 3. 对患者进行KFold切分
-    for fold, (train_patient_idx, test_patient_idx) in enumerate(kf.split(unique_patients)):
+    # 3. 对患者进行分层KFold切分（保证每个fold的MVI+比例一致）
+    for fold, (train_patient_idx, test_patient_idx) in enumerate(skf.split(unique_patients, patient_labels)):
         # 4. 将患者索引转换为图像索引
         train_patients = [unique_patients[i] for i in train_patient_idx]
         test_patients = [unique_patients[i] for i in test_patient_idx]
@@ -411,6 +302,8 @@ def train_multimodal():
         print(f"\n--- Fold {fold+1}/{N_SPLITS} ---")
         print(f"训练集: {len(train_patients)} 个患者, {len(train_idx)} 张图像")
         print(f"测试集: {len(test_patients)} 个患者, {len(test_idx)} 张图像")
+        test_pos = sum(1 for p in test_patients if patient_label_map[p] == 1)
+        print(f"  测试集 MVI+: {test_pos}/{len(test_patients)}")
 
         train_dataset = KFoldDatasetWrapper(Subset(base_dataset, train_idx), transform=train_transform)
         test_dataset = KFoldDatasetWrapper(Subset(base_dataset, test_idx), transform=test_transform)
@@ -462,45 +355,20 @@ def train_multimodal():
                     out = model(x, c)
                     probs = torch.softmax(out, dim=1)[:, 1]
                     preds = torch.argmax(out, dim=1)
-
+                    
                     y_true.extend(y.cpu().numpy())
                     y_prob.extend(probs.cpu().numpy())
                     y_pred.extend(preds.cpu().numpy())
-
-            # 图像级别评估
+                    
             val_auc = roc_auc_score(y_true, y_prob)
-
-            # 【Step 6】患者级别评估：同一患者的多张图像概率取平均
-            from collections import defaultdict
-            test_patient_ids = [os.path.basename(base_dataset.image_paths[i]).split('_')[0] for i in test_idx]
-
-            patient_probs = defaultdict(list)
-            patient_labels = {}
-            for pid, prob, true_label in zip(test_patient_ids, y_prob, y_true):
-                patient_probs[pid].append(prob)
-                patient_labels[pid] = true_label
-
-            # 患者级别：同一患者所有图像概率取平均
-            patient_y_true = []
-            patient_y_prob = []
-            for pid in patient_probs:
-                patient_y_true.append(patient_labels[pid])
-                patient_y_prob.append(np.mean(patient_probs[pid]))
-
-            patient_y_pred = [1 if p > 0.5 else 0 for p in patient_y_prob]
-
-            # 患者级别指标
-            val_auc_patient = roc_auc_score(patient_y_true, patient_y_prob)
-
+            
             if (epoch+1) % 10 == 0 or epoch == EPOCHS - 1:
-                print(f"Epoch [{epoch+1}/{EPOCHS}] Train Loss: {train_loss:.4f}")
-                print(f"  图像级别 AUC: {val_auc:.4f} | 患者级别 AUC: {val_auc_patient:.4f}")
-
-            # 使用患者级别AUC作为模型选择标准
-            if val_auc_patient > best_auc:
-                best_auc = val_auc_patient
-                best_acc = accuracy_score(patient_y_true, patient_y_pred)
-                tn, fp, fn, tp = confusion_matrix(patient_y_true, patient_y_pred, labels=[0, 1]).ravel()
+                print(f"Epoch [{epoch+1}/{EPOCHS}] Train Loss: {train_loss:.4f} | Val AUC: {val_auc:.4f}")
+            
+            if val_auc > best_auc:
+                best_auc = val_auc
+                best_acc = accuracy_score(y_true, y_pred)
+                tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
                 best_sen = tp / (tp + fn + 1e-6)
                 best_spe = tn / (tn + fp + 1e-6)
                 
