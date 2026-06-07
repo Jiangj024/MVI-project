@@ -3,12 +3,12 @@
 MVIData_*/
 MVI0201_test/
 MVI0318_test/
-MVI0325_test/
+# MVI0325_test/
 MVI0508_cross/
 
 # 忽略模型权重文件及文件夹
 *.pth
-*.pt
+# *.pt
 pretrained_weights/
 MVI_paper_pth/
 MVI_vit_pth/
